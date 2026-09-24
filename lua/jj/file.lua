@@ -300,12 +300,123 @@ function M.read_target(opts)
 	end, string.format("Could not read `%s` from `%s`", path, revision))
 end
 
+--- Commit IDs of all visible commits of a change.
+--- @param change_id string
+--- @return table<string, boolean>|nil commit_ids
+--- @return integer count
+local function list_change_commits(change_id)
+	local raw, ok = runner.execute({
+		"jj",
+		"log",
+		"--no-graph",
+		"-r",
+		string.format("change_id(%s)", change_id),
+		"-T",
+		'commit_id ++ "\n"',
+		"--quiet",
+	}, nil, nil, true)
+	if not ok or not raw then
+		return nil, 0
+	end
+	local commit_ids, count = {}, 0
+	for _, commit_id in ipairs(vim.split(vim.trim(raw), "\n", { trimempty = true })) do
+		commit_ids[commit_id] = true
+		count = count + 1
+	end
+	return commit_ids, count
+end
+
+--- If `id` is a commit ID (how a divergent revision is named), return its
+--- change ID and the commit IDs of that change. Returns nil for a change ID,
+--- which already follows rewrites.
+--- @param id string
+--- @return string|nil change_id
+--- @return table<string, boolean>|nil commit_ids
+local function commit_named_change(id)
+	-- Change IDs use the letters k-z only, so a hex ID is a commit ID.
+	if not id:match("^[0-9a-f]+$") then
+		return nil
+	end
+	local change_id, ok = runner.execute(
+		{ "jj", "log", "--no-graph", "-r", id, "-T", "change_id", "--quiet" },
+		nil,
+		nil,
+		true
+	)
+	if not ok or not change_id then
+		return nil
+	end
+	change_id = vim.trim(change_id)
+	local commit_ids = list_change_commits(change_id)
+	if not commit_ids then
+		return nil
+	end
+	return change_id, commit_ids
+end
+
+--- After a write through a commit ID, point the buffer at the commit that
+--- replaced it, so later writes and `:e` use the current content. Goes back to
+--- the change ID once the change is no longer divergent.
+--- @param buf integer
+--- @param change_id string
+--- @param before table<string, boolean> Commit IDs of the change before the write
+--- @param rel_path string
+local function follow_rewritten_commit(buf, change_id, before, rel_path)
+	local after, count = list_change_commits(change_id)
+	if not after then
+		return
+	end
+	local new_id
+	if count == 1 then
+		new_id = change_id
+	else
+		local added = vim.tbl_filter(function(commit_id)
+			return not before[commit_id]
+		end, vim.tbl_keys(after))
+		-- More than one new commit happens when one divergent copy descends from
+		-- another and gets rebased too. Keep the old name; the hidden check then
+		-- refuses the next write.
+		if #added ~= 1 then
+			return
+		end
+		new_id = added[1]
+	end
+
+	local old_name = vim.api.nvim_buf_get_name(buf)
+	local new_name = string.format("jj://%s/%s", new_id, rel_path)
+	if old_name == new_name then
+		return
+	end
+	-- `keepalt` keeps the user's alternate file; a plain rename replaces it
+	-- with the old name.
+	local ok, err = pcall(vim.api.nvim_buf_call, buf, function()
+		vim.cmd("keepalt file " .. vim.fn.fnameescape(new_name))
+	end)
+	if not ok then
+		-- E95: another buffer already has the new name.
+		utils.notify(
+			string.format("Written, but could not rename buffer to %s: %s", new_name, err),
+			vim.log.levels.WARN
+		)
+		return
+	end
+	-- Renaming leaves an unlisted buffer behind under the old name.
+	for _, other in ipairs(vim.api.nvim_list_bufs()) do
+		if other ~= buf and vim.api.nvim_buf_get_name(other) == old_name then
+			pcall(vim.api.nvim_buf_delete, other, { force = true })
+		end
+	end
+end
+
 --- Write buffer content back into a jj revision, bypassing the working copy.
 --- @param buf integer
 --- @param change_id string
 --- @param rel_path string Repository-relative path of the file
 --- @param force boolean Whether to bypass the immutability check (`:w!`)
 local function write_revision_file(buf, change_id, rel_path, force)
+	-- The buffer name is the source of truth: it moves to the new commit after
+	-- a write to a divergent revision.
+	change_id = utils.parse_jj_uri(vim.api.nvim_buf_get_name(buf)) or change_id
 	-- A divergent revision is named by its commit ID, and a write rewrites that
 	-- commit. Writing through the stale ID again would revive the old commit.
 	if utils.is_commit_hidden(change_id) then
@@ -362,6 +473,7 @@ local function write_revision_file(buf, change_id, rel_path, force)
 		"--",
 		jj_args.fileset(rel_path),
 	}
+	local named_change_id, before = commit_named_change(change_id)
 	local _, ok = runner.execute(cmd, "jj: failed to edit revision")
 
 	os.remove(tmp)
@@ -371,6 +483,9 @@ local function write_revision_file(buf, change_id, rel_path, force)
 	end
 	vim.bo[buf].modified = false
 	utils.notify(string.format("Written to revision %s", change_id))
+	if named_change_id then
+		follow_rewritten_commit(buf, named_change_id, before, rel_path)
+	end
 end
 M.write_revision_file = write_revision_file
 

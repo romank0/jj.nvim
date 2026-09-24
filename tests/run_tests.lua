@@ -1053,6 +1053,102 @@ run_test("write_revision_file: refuses to write to a hidden commit", function()
 	end)
 end)
 
+print("\n=== Running write_revision_file rename tests ===\n")
+
+--- Fake jj for a write to commit `aaa1` of change `kopm`. `after` lists the
+--- change's commits once the write has run.
+local function fake_divergent_write(after)
+	local written = false
+	return function(cmd)
+		local joined = table.concat(cmd, " ")
+		if joined:find("diffedit", 1, true) then
+			written = true
+			return "", true
+		elseif vim.tbl_contains(cmd, "hidden") or vim.tbl_contains(cmd, "immutable") then
+			return "false\n", true
+		elseif vim.tbl_contains(cmd, "change_id(kopm)") then
+			return written and after or "aaa1\nbbb2\n", true
+		elseif vim.tbl_contains(cmd, "change_id") then
+			return "kopm\n", true
+		end
+		error("unexpected command: " .. joined)
+	end
+end
+
+--- Returns the buffer's new name and whether a buffer still has the old one.
+local function write_divergent(after)
+	local jj_file = require("jj.file")
+	local old_name = "jj://aaa1/src/file.py"
+	local buf = vim.api.nvim_create_buf(true, false)
+	vim.api.nvim_buf_set_name(buf, old_name)
+	with_execute(fake_divergent_write(after), function()
+		jj_file.write_revision_file(buf, "aaa1", "src/file.py", false)
+	end)
+	local name = vim.api.nvim_buf_get_name(buf)
+	local stale = false
+	for _, other in ipairs(vim.api.nvim_list_bufs()) do
+		if vim.api.nvim_buf_get_name(other) == old_name then
+			stale = true
+			vim.api.nvim_buf_delete(other, { force = true })
+		end
+	end
+	if vim.api.nvim_buf_is_valid(buf) then
+		vim.api.nvim_buf_delete(buf, { force = true })
+	end
+	return name, stale
+end
+
+run_test("write_revision_file: follows the rewritten commit of a divergent change", function()
+	local name, stale = write_divergent("ccc3\nbbb2\n")
+	assert_equals("jj://ccc3/src/file.py", name)
+	assert_equals(false, stale, "no buffer is left under the old name")
+end)
+
+run_test("write_revision_file: goes back to the change id once it is no longer divergent", function()
+	assert_equals("jj://kopm/src/file.py", (write_divergent("ccc3\n")))
+end)
+
+run_test("write_revision_file: keeps the name when the new one is taken", function()
+	local taken = vim.api.nvim_create_buf(true, false)
+	vim.api.nvim_buf_set_name(taken, "jj://kopm/src/file.py")
+	local ok, name = pcall(write_divergent, "ccc3\n")
+	vim.api.nvim_buf_delete(taken, { force = true })
+	assert_equals(true, ok, tostring(name))
+	assert_equals("jj://aaa1/src/file.py", name)
+end)
+
+run_test("write_revision_file: keeps the alternate file across the rename", function()
+	local alt = vim.api.nvim_create_buf(true, false)
+	vim.api.nvim_buf_set_name(alt, "/tmp/jj-nvim-test-alt")
+	local jj_file = require("jj.file")
+	local buf = vim.api.nvim_create_buf(true, false)
+	vim.api.nvim_buf_set_name(buf, "jj://aaa1/src/file.py")
+	vim.api.nvim_set_current_buf(alt)
+	vim.api.nvim_set_current_buf(buf)
+	with_execute(fake_divergent_write("ccc3\nbbb2\n"), function()
+		jj_file.write_revision_file(buf, "aaa1", "src/file.py", false)
+	end)
+	local alt_name = vim.fn.bufname("#")
+	vim.api.nvim_buf_delete(buf, { force = true })
+	vim.api.nvim_buf_delete(alt, { force = true })
+	assert_equals("/tmp/jj-nvim-test-alt", alt_name)
+end)
+
+run_test("write_revision_file: a change id buffer makes no extra jj calls", function()
+	local jj_file = require("jj.file")
+	local buf = vim.api.nvim_create_buf(true, false)
+	vim.api.nvim_buf_set_name(buf, "jj://kopm/src/file.py")
+	local calls = {}
+	with_execute(function(cmd)
+		table.insert(calls, cmd)
+		return vim.tbl_contains(cmd, "diffedit") and "" or "false\n", true
+	end, function()
+		jj_file.write_revision_file(buf, "kopm", "src/file.py", false)
+	end)
+	vim.api.nvim_buf_delete(buf, { force = true })
+	assert_equals(3, #calls, "hidden check, immutable check, diffedit")
+end)
+
 -- Print summary
 print(string.format("\n=== Test Summary ==="))
 print(string.format("Passed: %d", tests_passed))
